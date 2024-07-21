@@ -930,7 +930,6 @@ class ExLlamaV2:
                 data_name:str | None = None,
                 model_name:str | None = None,
                 k_need_index:torch.Tensor | None = None,
-                k_diff:int | None = None,
                 **kwargs) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """
@@ -1029,7 +1028,6 @@ class ExLlamaV2:
             kwargs['data_name'] = data_name
             kwargs['model_name'] = model_name
             kwargs['k_need_index'] = k_need_index
-            kwargs['k_diff'] = k_diff
             r, ls = self._forward(input_ids = input_ids[:, chunk_begin : chunk_end],
                                   cache = cache,
                                   input_mask = input_mask,
@@ -1564,7 +1562,7 @@ class ExLlamaV2:
                     x = x.narrow(-2, -1, 1)
                 elif return_last_state:
                     last_state = x.narrow(-2, -1, 1)
-            if idx >= 6:
+            if idx >= 9:
                 break
             x = safe_move_tensor(x, device)
             x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)

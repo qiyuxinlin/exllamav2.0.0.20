@@ -816,6 +816,9 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 			key_states = key_states.transpose(-1, -2)
 
 			attn_weights = torch.matmul(query_states, key_states)
+			# weight = attn_weights.squeeze(0)
+			# weight = weight[:,-62:,:-62]
+			# torch.save(weight,f'weight_{self.layer_idx}.pt')
 			attn_weights /= math.sqrt(head_dim)
 			attn_mask = attn_params.get_attn_mask(hidden_states.device)
 			if attn_mask is not None: attn_weights = attn_weights + attn_mask
