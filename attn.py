@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 	from exllamav2.model import ExLlamaV2
 
 # Detect flash-attn
-
+k_need_index = []
 has_flash_attn = False
 try:
 	import flash_attn
@@ -467,6 +467,22 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 				**kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
 
 		global has_flash_attn
+		if 'importance' in kwargs.keys() and kwargs['importance'] is not None:
+			return self.forward_query_select_token(hidden_states,
+									  cache,
+									  attn_params,
+									  past_len,
+									  intermediates,
+									  loras = loras,
+									  **kwargs)
+		if 'rate' in kwargs.keys() and kwargs['rate'] is not None:
+			return self.forward_rate(hidden_states,
+									  cache,
+									  attn_params,
+									  past_len,
+									  intermediates,
+									  loras = loras,
+									  **kwargs)
 		if 'k_need_index' in kwargs.keys():
 			return self.forward_retrival(hidden_states,
 									  cache,
@@ -477,6 +493,14 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 									  **kwargs)
 		elif 'dump_forward' in kwargs.keys():
 			return self.forward_dump(hidden_states,
+									  cache,
+									  attn_params,
+									  past_len,
+									  intermediates,
+									  loras = loras,
+									  **kwargs)
+		elif 'dump_forward_importance' in kwargs.keys():
+			return self.forward_dump_importance(hidden_states,
 									  cache,
 									  attn_params,
 									  past_len,
@@ -858,6 +882,131 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 			return hidden_states
 		
 	
+	def forward_query_select_token(self,
+					  hidden_states: torch.Tensor,
+					  cache: ExLlamaV2CacheBase | None = None,
+					  attn_params: ExLlamaV2Attention.Params | None = None,
+					  past_len: int | None = None,
+					  intermediates: bool = False,
+					  loras: list[ExLlamaV2Lora] | None = None,
+					  **kwargs) -> torch.Tensor | dict:
+		importance = kwargs['importance']
+		tokens_len = kwargs['tokens_len']
+		cfg = self.model.config
+		num_attention_heads = cfg.num_attention_heads
+		num_key_value_heads = cfg.num_key_value_heads
+		num_key_value_groups = cfg.num_key_value_groups
+		head_dim = cfg.head_dim
+		hidden_size = cfg.hidden_size
+
+		batch_size, q_len, _ = hidden_states.size()
+
+		past_len = 0 if cache is None else cache.current_seq_len
+
+		# Project q, k, v
+
+		residual = hidden_states
+		post_norm = self.input_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+
+		query_states = self.q_proj.forward(post_norm, loras = loras)
+		key_states = self.k_proj.forward(post_norm, loras = loras)
+		value_states = self.v_proj.forward(post_norm, loras = loras)
+
+		# Shape for attention
+
+		query_states = query_states.view(batch_size, q_len, num_attention_heads, head_dim)
+		key_states = key_states.view(batch_size, q_len, num_key_value_heads, head_dim)
+		value_states = value_states.view(batch_size, q_len, num_key_value_heads, head_dim)
+
+		# Apply Q/K norms
+
+		if cfg.use_qk_norm:
+			query_states = self.q_norm.forward(query_states)
+			key_states = self.k_norm.forward(key_states)
+
+		# Apply position embeddings
+
+		constants = self.model.get_device_tensors(self.device_idx, scratch = False)
+
+		if attn_params.position_offsets is not None:
+			position_offsets = attn_params.get_position_offsets(hidden_states.device)
+		else:
+			position_offsets = none_tensor
+
+		ext_c.rope_(query_states, constants.sin, constants.cos, past_len, num_attention_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+		ext_c.rope_(key_states, constants.sin, constants.cos, past_len, num_key_value_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+
+		# Add keys and values to cache
+
+		if cache is not None:
+
+			batch_keys, batch_values = cache.get_kv_state(self.layer_idx, batch_size, 0, past_len)
+			new_keys = batch_keys.narrow(1, past_len, q_len).narrow(0, 0, batch_size)
+			new_values = batch_values.narrow(1, past_len, q_len).narrow(0, 0, batch_size)
+			new_keys.copy_(key_states)
+			new_values.copy_(value_states)
+
+			# Key/value tensors with past
+
+			key_states = batch_keys.narrow(1, 0, past_len + q_len).narrow(0, 0, batch_size)
+			value_states = batch_values.narrow(1, 0, past_len + q_len).narrow(0, 0, batch_size)
+
+			if isinstance(cache,ExLlamaV2Cache_CPU):
+				cache.store_kv_state(self.layer_idx, batch_size, past_len+q_len,key_states,value_states)
+				torch.cuda.empty_cache()
+		# Torch matmul attention
+
+		if cfg.no_flash_attn or not has_flash_attn or not attn_params.is_causal():
+
+			query_states = query_states.transpose(1, 2)
+			key_states = key_states.transpose(1, 2)
+			value_states = value_states.transpose(1, 2)
+
+			key_states = self.repeat_kv(key_states, cfg.num_key_value_groups)
+			key_states = key_states.transpose(-1, -2)
+
+			attn_weights = torch.matmul(query_states, key_states)
+			# weight = attn_weights.squeeze(0)
+			# weight = weight[:,-62:,:-62]
+			# torch.save(weight,f'weight_{self.layer_idx}.pt')
+			attn_weights /= math.sqrt(head_dim)
+			attn_mask = attn_params.get_attn_mask(hidden_states.device)
+			if attn_mask is not None: attn_weights = attn_weights + attn_mask
+			attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
+
+			value_states = self.repeat_kv(value_states, cfg.num_key_value_groups)
+			attn_output = torch.matmul(attn_weights, value_states)
+
+			attn_output = attn_output.transpose(1, 2)
+			attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
+
+		# Flash Attention 2
+
+		else:
+
+			attn_output = flash_attn_func(query_states, key_states, value_states, causal = True)
+			attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
+
+		# Update 8-bit/Q4 cache
+
+		if cache is not None and not isinstance(cache, ExLlamaV2Cache_CPU):
+			cache.store_kv_state(self.layer_idx, batch_size, past_len, q_len)
+
+		# Output projection
+
+		attn_proj = self.o_proj.forward(attn_output, loras = loras)
+
+		# Add residual connection
+
+		hidden_states = (attn_proj + residual) if self.has_residual else attn_proj
+
+		if intermediates:
+			return {"post_norm": post_norm,
+					"attn_output": attn_output,
+					"hidden_states": hidden_states}
+		else:
+			return hidden_states
+		
 	def forward_dump(self,
 					  hidden_states: torch.Tensor,
 					  cache: ExLlamaV2CacheBase | None = None,
@@ -867,6 +1016,160 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 					  loras: list[ExLlamaV2Lora] | None = None,
 					  **kwargs) -> torch.Tensor | dict:
 
+		cfg = self.model.config
+		num_attention_heads = cfg.num_attention_heads
+		num_key_value_heads = cfg.num_key_value_heads
+		num_key_value_groups = cfg.num_key_value_groups
+		head_dim = cfg.head_dim
+		hidden_size = cfg.hidden_size
+
+		batch_size, q_len, _ = hidden_states.size()
+
+		past_len = 0 if cache is None else cache.current_seq_len
+
+		# Project q, k, v
+
+		residual = hidden_states
+		post_norm = self.input_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+
+		query_states = self.q_proj.forward(post_norm, loras = loras)
+		key_states = self.k_proj.forward(post_norm, loras = loras)
+		value_states = self.v_proj.forward(post_norm, loras = loras)
+
+		# Shape for attention
+
+		query_states = query_states.view(batch_size, q_len, num_attention_heads, head_dim)
+		key_states = key_states.view(batch_size, q_len, num_key_value_heads, head_dim)
+		value_states = value_states.view(batch_size, q_len, num_key_value_heads, head_dim)
+		# query select token
+		# if kwargs['context_id'] == 11 and self.layer_idx == 31:
+
+		# Apply Q/K norms
+
+		if cfg.use_qk_norm:
+			query_states = self.q_norm.forward(query_states)
+			key_states = self.k_norm.forward(key_states)
+
+		# Apply position embeddings
+
+		constants = self.model.get_device_tensors(self.device_idx, scratch = False)
+
+		if attn_params.position_offsets is not None:
+			position_offsets = attn_params.get_position_offsets(hidden_states.device)
+		else:
+			position_offsets = none_tensor
+
+		ext_c.rope_(query_states, constants.sin, constants.cos, past_len, num_attention_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+		ext_c.rope_(key_states, constants.sin, constants.cos, past_len, num_key_value_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)		
+
+		if kwargs['context_id'] == kwargs['context_num']:
+			assert past_len == 0
+			data_name = kwargs['data_name']
+			model_name = kwargs['model_name']
+			index = kwargs['index']
+			system_len = kwargs['system_len']
+			query_prefix_len = kwargs['query_prefix_len']
+			query_states_copy = query_states.clone()
+			query_states_copy = query_states_copy.transpose(1, 2)
+			query_states_copy = query_states_copy[:,:,system_len+query_prefix_len:,:]
+			p_len = 0
+			if self.layer_idx == 0:
+				cache.importance.zero_()
+			for context_id in range(1,kwargs['context_num']):
+				context_key = torch.load(f'./cacheDump/data/{data_name}/{model_name}/{index}_{context_id}_{self.layer_idx}_key.pt')[:,system_len:,:,:]
+				context_key = context_key.transpose(1, 2)
+				context_key = self.repeat_kv(context_key, cfg.num_key_value_groups)
+				context_key = context_key.transpose(-1, -2)
+				# batch_size num_heads q_len k_len
+				attn_weights = torch.matmul(query_states_copy, context_key)
+				attn_weights /= math.sqrt(head_dim)
+				attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
+				attn_weights = torch.sum(torch.sum(attn_weights, dim=0),dim=-2)
+				cache_import = cache.importance[self.layer_idx].narrow(0,p_len, attn_weights.shape[1])
+				cache_import.copy_(attn_weights.transpose(0,1).contiguous())
+				p_len += attn_weights.shape[1]
+			cache.dump_importance(index, model_name, data_name, p_len)
+		# Add keys and values to cache
+
+		if cache is not None:
+
+			batch_keys, batch_values = cache.get_kv_state(self.layer_idx, batch_size, 0, past_len)
+			new_keys = batch_keys.narrow(1, past_len, q_len).narrow(0, 0, batch_size)
+			new_values = batch_values.narrow(1, past_len, q_len).narrow(0, 0, batch_size)
+			new_keys.copy_(key_states)
+			new_values.copy_(value_states)
+
+			# Key/value tensors with past
+
+			key_states = batch_keys.narrow(1, 0, past_len + q_len).narrow(0, 0, batch_size)
+			value_states = batch_values.narrow(1, 0, past_len + q_len).narrow(0, 0, batch_size)
+
+			if isinstance(cache,ExLlamaV2Cache_CPU):
+				cache.store_kv_state(self.layer_idx, batch_size, past_len+q_len,key_states,value_states)
+				torch.cuda.empty_cache()
+		
+
+		# Torch matmul attention
+
+		if cfg.no_flash_attn or not has_flash_attn or not attn_params.is_causal():
+
+			query_states = query_states.transpose(1, 2)
+			key_states = key_states.transpose(1, 2)
+			value_states = value_states.transpose(1, 2)
+
+			key_states = self.repeat_kv(key_states, cfg.num_key_value_groups)
+			key_states = key_states.transpose(-1, -2)
+
+			attn_weights = torch.matmul(query_states, key_states)
+			attn_weights /= math.sqrt(head_dim)
+			attn_mask = attn_params.get_attn_mask(hidden_states.device)
+			if attn_mask is not None: attn_weights = attn_weights + attn_mask
+			attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
+
+			value_states = self.repeat_kv(value_states, cfg.num_key_value_groups)
+			attn_output = torch.matmul(attn_weights, value_states)
+
+			attn_output = attn_output.transpose(1, 2)
+			attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
+
+
+		# Flash Attention 2
+
+		else:
+
+			attn_output = flash_attn_func(query_states, key_states, value_states, causal = True)
+			attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
+
+		# Update 8-bit/Q4 cache
+
+		if cache is not None and not isinstance(cache, ExLlamaV2Cache_CPU):
+			cache.store_kv_state(self.layer_idx, batch_size, past_len, q_len)
+
+		# Output projection
+
+		attn_proj = self.o_proj.forward(attn_output, loras = loras)
+
+		# Add residual connection
+
+		hidden_states = (attn_proj + residual) if self.has_residual else attn_proj
+
+		if intermediates:
+			return {"post_norm": post_norm,
+					"attn_output": attn_output,
+					"hidden_states": hidden_states}
+		else:
+			return hidden_states
+		
+	def forward_dump_importance(self,
+					  hidden_states: torch.Tensor,
+					  cache: ExLlamaV2CacheBase | None = None,
+					  attn_params: ExLlamaV2Attention.Params | None = None,
+					  past_len: int | None = None,
+					  intermediates: bool = False,
+					  loras: list[ExLlamaV2Lora] | None = None,
+					  **kwargs) -> torch.Tensor | dict:
+		p_len = kwargs['p_len']
+		system_len = kwargs['system_len']
 		cfg = self.model.config
 		num_attention_heads = cfg.num_attention_heads
 		num_key_value_heads = cfg.num_key_value_heads
@@ -933,34 +1236,29 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 		# Torch matmul attention
 
-		if cfg.no_flash_attn or not has_flash_attn or not attn_params.is_causal():
-
-			query_states = query_states.transpose(1, 2)
-			key_states = key_states.transpose(1, 2)
-			value_states = value_states.transpose(1, 2)
-
-			key_states = self.repeat_kv(key_states, cfg.num_key_value_groups)
-			key_states = key_states.transpose(-1, -2)
-
-			attn_weights = torch.matmul(query_states, key_states)
-			attn_weights /= math.sqrt(head_dim)
-			attn_mask = attn_params.get_attn_mask(hidden_states.device)
-			if attn_mask is not None: attn_weights = attn_weights + attn_mask
-			attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
-
-			value_states = self.repeat_kv(value_states, cfg.num_key_value_groups)
-			attn_output = torch.matmul(attn_weights, value_states)
-
-			attn_output = attn_output.transpose(1, 2)
-			attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
-
-		# Flash Attention 2
-
-		else:
-
-			attn_output = flash_attn_func(query_states, key_states, value_states, causal = True)
-			attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
-
+		query_states = query_states.transpose(1, 2)
+		key_states = key_states.transpose(1, 2)
+		value_states = value_states.transpose(1, 2)
+		key_states = self.repeat_kv(key_states, cfg.num_key_value_groups)
+		key_states = key_states.transpose(-1, -2)
+		attn_weights = torch.matmul(query_states, key_states)
+		attn_weights_importance = attn_weights.clone()
+		attn_weights /= math.sqrt(head_dim)
+		attn_mask = attn_params.get_attn_mask(hidden_states.device)
+		if attn_mask is not None: attn_weights = attn_weights + attn_mask
+		attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
+		value_states = self.repeat_kv(value_states, cfg.num_key_value_groups)
+		attn_output = torch.matmul(attn_weights, value_states)
+		attn_output = attn_output.transpose(1, 2)
+		attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
+		# 后面再改
+		attn_weights_importance = attn_weights_importance + attn_mask
+		importance = torch.sum(attn_weights_importance,dim=0)
+		importance = importance[:,system_len:,system_len:]
+		importance = nn.functional.softmax(importance, dim = -1, dtype = torch.float16)
+		importance = torch.sum(importance, dim=-2) / (q_len - system_len)
+		cache_import = cache.importance[self.layer_idx].narrow(0,past_len + p_len,(q_len-system_len))
+		cache_import.copy_(importance.transpose(0,1).contiguous())
 		# Update 8-bit/Q4 cache
 
 		if cache is not None and not isinstance(cache, ExLlamaV2Cache_CPU):
@@ -1005,7 +1303,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 		num_key_value_groups = cfg.num_key_value_groups
 		head_dim = cfg.head_dim
 		hidden_size = cfg.hidden_size
-
+		tokens_start = [sum(tokens_len[0][:i]) for i in range(1,len(tokens_len[0]))]
 		batch_size, q_len, _ = hidden_states.size()
 		k_need_index = k_need_index[(k_need_index >= chunk_begin) & (k_need_index < chunk_end)]
 		k_need_index = k_need_index - chunk_begin
@@ -1028,7 +1326,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 		query_states = query_states.view(batch_size, q_len, num_attention_heads, head_dim)
 		key_states = key_states.view(batch_size, q_len, num_key_value_heads, head_dim)
 		value_states = value_states.view(batch_size, q_len, num_key_value_heads, head_dim)
-
+		
 		# Apply Q/K norms
 
 		if cfg.use_qk_norm:
@@ -1047,10 +1345,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 		ext_c.rope_(query_states, constants.sin, constants.cos, past_len, num_attention_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
 		ext_c.rope_(key_states, constants.sin, constants.cos, past_len, num_key_value_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
 
+
 		# Add keys and values to cache
 		# 召回kvcache
 		# 根据chunk_begin和chunk_end，选择召回哪些块
-		tokens_start = [sum(tokens_len[0][:i]) for i in range(1,len(tokens_len[0]))]
+		
 		context_ids = []
 		for index,token_start in enumerate(tokens_start):
 			if chunk_begin < token_start:
@@ -1163,6 +1462,215 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 		else:
 			return hidden_states
 
+	def forward_rate(self,
+					  hidden_states: torch.Tensor,
+					  cache: ExLlamaV2CacheBase | None = None,
+					  attn_params: ExLlamaV2Attention.Params | None = None,
+					  past_len: int | None = None,
+					  intermediates: bool = False,
+					  loras: list[ExLlamaV2Lora] | None = None,
+					  **kwargs) -> torch.Tensor | dict:
+		# k_need_index 是全文下标
+		system_len = kwargs['tokens_len'][0][0]
+		# query_len = kwargs['tokens_len'][0][-1]
+		data_name = kwargs['data_name']
+		model_name = kwargs['model_name']
+		tokens_len = kwargs['tokens_len']
+		batch = kwargs['batch']
+		chunk_begin = kwargs['chunk_begin']
+		chunk_end = kwargs['chunk_end']
+		rate = kwargs['rate']
+		cfg = self.model.config
+		num_attention_heads = cfg.num_attention_heads
+		num_key_value_heads = cfg.num_key_value_heads
+		num_key_value_groups = cfg.num_key_value_groups
+		head_dim = cfg.head_dim
+		hidden_size = cfg.hidden_size
+		tokens_start = [sum(tokens_len[0][:i]) for i in range(1,len(tokens_len[0]))]
+		batch_size, q_len, _ = hidden_states.size()
+		global k_need_index
+		assert q_len == chunk_end
+		# k_need_index = k_need_index[(k_need_index >= chunk_begin) & (k_need_index < chunk_end)]
+		# k_need_index = k_need_index - chunk_begin
+		past_len = 0 if cache is None else cache.current_seq_len
+				# # infiLLM
+		if rate != 0:
+			k_need_index = []
+			for i,chunk_start in enumerate(tokens_start):
+				if chunk_start == tokens_start[-1]:
+					break
+				chunk_end = tokens_start[i+1]
+				for j in range(chunk_start,chunk_start + int(rate*(chunk_end - chunk_start))):
+					k_need_index.append(j)
+			k_need_index = torch.tensor(k_need_index)
+			k_need_index = torch.cat((torch.arange(0,system_len),k_need_index),dim=0)
+
+			# attn_weights = torch.sum(torch.sum(attn_weights,dim=0),dim=0)
+			# r = torch.zeros(attn_weights.shape[1])
+			# for i,start in enumerate(tokens_start):
+			# 	if start == tokens_start[-1]:
+			# 		break
+			# 	end = tokens_start[i+1]
+			# 	for m in range(start,end):
+			# 		r[m] = torch.sum(attn_weights[start:end,m]) / (end - start)
+			# _, indice = torch.sort(r[tokens_start[1]:],descending=True)
+			# indice = indice[:int(len(indice)*rate)]
+			# indice = indice + tokens_start[1]
+			# k_need_index = torch.cat((torch.arange(0,system_len),indice),dim=0)
+
+		else: k_need_index = []
+		
+		# q 除 k_need_index以外都为空
+		hidden_zeros = torch.zeros((batch_size,q_len,hidden_size),dtype=hidden_states.dtype,device=hidden_states.device)
+		if self.layer_idx != 0 :
+			hidden_zeros[:,k_need_index,:] = hidden_states[:,k_need_index,:]
+			hidden_states = hidden_zeros
+		
+		# Project q, k, v
+		residual = hidden_states
+		post_norm = self.input_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+
+		query_states = self.q_proj.forward(post_norm, loras = loras)
+		key_states = self.k_proj.forward(post_norm, loras = loras)
+		value_states = self.v_proj.forward(post_norm, loras = loras)
+		
+		# Shape for attention
+
+		query_states = query_states.view(batch_size, q_len, num_attention_heads, head_dim)
+		key_states = key_states.view(batch_size, q_len, num_key_value_heads, head_dim)
+		value_states = value_states.view(batch_size, q_len, num_key_value_heads, head_dim)
+		
+
+
+
+		# Apply Q/K norms
+
+		if cfg.use_qk_norm:
+			query_states = self.q_norm.forward(query_states)
+			key_states = self.k_norm.forward(key_states)
+
+		# Apply position embeddings
+
+		constants = self.model.get_device_tensors(self.device_idx, scratch = False)
+
+		if attn_params.position_offsets is not None:
+			position_offsets = attn_params.get_position_offsets(hidden_states.device)
+		else:
+			position_offsets = none_tensor
+
+		ext_c.rope_(query_states, constants.sin, constants.cos, past_len, num_attention_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+		ext_c.rope_(key_states, constants.sin, constants.cos, past_len, num_key_value_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+
+		# Add keys and values to cache
+		# 召回kvcache
+		# 根据chunk_begin和chunk_end，选择召回哪些块
+		if self.layer_idx != 0:
+			context_ids = []
+			for index,token_start in enumerate(tokens_start):
+				if chunk_begin < token_start:
+					start_index = index
+					break
+			for index,token_start in enumerate(tokens_start):
+				if chunk_end <= token_start:
+					end_index = index
+					break
+			context_ids = range(start_index,end_index+1)
+			context_key = None
+			context_value = None
+			for context_id in context_ids:
+				if context_id == 0:
+					context_key_item = torch.load(f'./cacheDump/data/{data_name}/{model_name}/{batch}_1_{self.layer_idx}_key.pt')[:,:system_len]
+					context_value_item = torch.load(f'./cacheDump/data/{data_name}/{model_name}/{batch}_1_{self.layer_idx}_value.pt')[:,:system_len]
+					
+				else:
+					context_key_item = torch.load(f'./cacheDump/data/{data_name}/{model_name}/{batch}_{context_id}_{self.layer_idx}_key.pt')
+					# ext_c.rope_inverse_(context_key_item, constants.sin, constants.cos, 0, num_key_value_heads, head_dim, none_tensor, self.model.config.arch.rope_neox_style)
+					context_key_item = context_key_item[:,system_len:]
+					# ext_c.rope_(context_key_item, constants.sin, constants.cos, past_len, num_key_value_heads, head_dim, none_tensor, self.model.config.arch.rope_neox_style)
+					context_value_item = torch.load(f'./cacheDump/data/{data_name}/{model_name}/{batch}_{context_id}_{self.layer_idx}_value.pt')[:,system_len:]
+				assert context_key_item.shape[1] == tokens_len[0][context_id]
+					# if context_id != 0:
+					# 	ext_c.rope_(context_key_item, constants.sin, constants.cos, sum(tokens_len[0][1:context_id]), num_attention_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+					# 	ext_c.rope_(context_value_item, constants.sin, constants.cos, sum(tokens_len[0][1:context_id]), num_attention_heads, head_dim, position_offsets, self.model.config.arch.rope_neox_style)
+				if context_key == None:
+					context_key = context_key_item
+					context_value = context_value_item
+				else:
+					context_key = torch.cat((context_key,context_key_item),dim=1)
+					context_value = torch.cat((context_value,context_value_item), dim=1)
+			# 根据chunk_begin 和 chunk_end将不需要的部分删除掉
+			if start_index != 0:
+				context_key = context_key[:,chunk_begin - tokens_start[start_index-1]:chunk_end - tokens_start[start_index-1]]
+				context_value = context_value[:,chunk_begin - tokens_start[start_index-1]:chunk_end - tokens_start[start_index-1]]
+			else:
+				context_key = context_key[:,chunk_begin:chunk_end]
+				context_value = context_value[:,chunk_begin:chunk_end]
+			# # 修改 kvcache k_need_index
+			context_key[:,k_need_index,:,:] = key_states[:,k_need_index,:,:]
+			context_value[:,k_need_index,:,:] = value_states[:,k_need_index,:,:]
+			key_states = context_key
+			value_states = context_value
+
+		if cache is not None:
+
+			batch_keys, batch_values = cache.get_kv_state(self.layer_idx, batch_size, 0, past_len)
+			new_keys = batch_keys.narrow(1, past_len, q_len).narrow(0, 0, batch_size)
+			new_values = batch_values.narrow(1, past_len, q_len).narrow(0, 0, batch_size)
+			new_keys.copy_(key_states)
+			new_values.copy_(value_states)
+
+			# Key/value tensors with past
+
+			key_states = batch_keys.narrow(1, 0, past_len + q_len).narrow(0, 0, batch_size)
+			value_states = batch_values.narrow(1, 0, past_len + q_len).narrow(0, 0, batch_size)
+
+			if isinstance(cache,ExLlamaV2Cache_CPU):
+				cache.store_kv_state(self.layer_idx, batch_size, past_len+q_len,key_states,value_states)
+				torch.cuda.empty_cache()
+		# Torch matmul attention
+
+
+		query_states = query_states.transpose(1, 2)
+		key_states = key_states.transpose(1, 2)
+		value_states = value_states.transpose(1, 2)
+
+		key_states = self.repeat_kv(key_states, cfg.num_key_value_groups)
+		key_states = key_states.transpose(-1, -2)
+
+		attn_weights = torch.matmul(query_states, key_states)
+		attn_weights /= math.sqrt(head_dim)
+		attn_mask = attn_params.get_attn_mask(hidden_states.device)
+		if attn_mask is not None: attn_weights = attn_weights + attn_mask
+		attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
+
+		value_states = self.repeat_kv(value_states, cfg.num_key_value_groups)
+		attn_output = torch.matmul(attn_weights, value_states)
+
+		attn_output = attn_output.transpose(1, 2)
+		attn_output = attn_output.reshape((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
+
+
+
+		# Update 8-bit/Q4 cache
+
+		if cache is not None and not isinstance(cache, ExLlamaV2Cache_CPU):
+			cache.store_kv_state(self.layer_idx, batch_size, past_len, q_len)
+
+		# Output projection
+
+		attn_proj = self.o_proj.forward(attn_output, loras = loras)
+
+		# Add residual connection
+
+		hidden_states = (attn_proj + residual) if self.has_residual else attn_proj
+
+		if intermediates:
+			return {"post_norm": post_norm,
+					"attn_output": attn_output,
+					"hidden_states": hidden_states}
+		else:
+			return hidden_states
+
 	def update_loras(self):
 
 		if self.q_handle is None: return
@@ -1193,4 +1701,3 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 	def is_quant(self):
 		return self.q_handle is not None
-

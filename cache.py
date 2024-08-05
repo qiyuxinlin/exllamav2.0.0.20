@@ -502,3 +502,99 @@ class ExLlamaV2Cache_CPU(ExLlamaV2CacheBase):
 
         new = ExLlamaV2Cache(self.model, self.batch_size, self.max_seq_len, self)
         return new
+    
+
+class ExLlamaV2Cache_importance(ExLlamaV2CacheBase):
+    """
+    FP16 cache
+    """
+    def __init__(self,
+                 model: ExLlamaV2,
+                 batch_size: int = 1,
+                 max_seq_len: int = -1,
+                 copy_from: ExLlamaV2Cache | None = None,
+                 lazy: bool = False):
+
+        super().__init__(model, batch_size, max_seq_len, torch.half, 1, False)
+        self.shape_importance = (model.config.num_hidden_layers, self.max_seq_len, model.config.num_attention_heads)
+        self.importance = torch.zeros(self.shape_importance)
+        self.create_state_tensors(copy_from, lazy)
+
+
+    def get_kv_state(self,
+                     layer_idx: int,
+                     batch_size: int,
+                     offset: int,
+                     width: int) -> (torch.Tensor, torch.Tensor):
+
+        return self.key_states[layer_idx], self.value_states[layer_idx]
+
+
+    def store_kv_state(self,
+                       layer_idx: int,
+                       batch_size: int,
+                       offset: int,
+                       width: int):
+
+        pass
+
+    def dump_state(self,context_id,index,data_name,model_name):
+        for i in range(self.num_hidden_layers):
+            torch.save(self.key_states[i][:,:self.current_seq_len,:,:].clone(), f'./cacheDump/data/{data_name}/{model_name}/{index}_{context_id}_{i}_key.pt')
+            torch.save(self.value_states[i][:,:self.current_seq_len,:,:].clone(), f'./cacheDump/data/{data_name}/{model_name}/{index}_{context_id}_{i}_value.pt') 
+    
+    def dump_importance(self, batch, model_name, data_name, tokens_len):
+        q_len = (self.importance[0].any(dim=-1)).sum()
+        assert q_len == tokens_len
+        for i in range(self.num_hidden_layers):
+            torch.save(self.importance[i][:q_len,:].clone(), f'./cacheDump/data/{data_name}/{model_name}/{batch}_{i}_importance.pt')
+
+    def load_importance(self, batch, model_name, data_name, tokens_len):
+        for i in range(self.num_hidden_layers):
+            self.importance[i][:tokens_len,:] = torch.load(f'./cacheDump/data/{data_name}/{model_name}/{batch}_{i}_importance.pt')
+        
+        return self.importance
+    @torch.inference_mode()
+    def load_state(self,index,tokens_len):
+        self.current_seq_len = 0
+        system_len = tokens_len[0][0]
+        query_len = tokens_len[0][-1]
+        total_lens = 0
+        for layer_index in range(self.num_hidden_layers):
+            batch_keys, batch_values = self.get_kv_state(layer_index, 1, 0, 0)
+            for context_id in range(0,12):
+                if context_id == 0:
+                    key = torch.load(f'./cacheDump/data/{index}_{10}_{layer_index}_key.pt')[:,:system_len]
+                    value = torch.load(f'./cacheDump/data/{index}_{10}_{layer_index}_value.pt')[:,:system_len]
+                    new_keys = batch_keys.narrow(1, 0, system_len)
+                    new_values = batch_values.narrow(1, 0, system_len)
+                    new_keys.copy_(key)
+                    new_values.copy_(value)
+                    total_lens += key.shape[1]
+                elif context_id == 11:
+                    # key = torch.load(f'./cacheDump/data/{index}_{10}_{layer_index}_key.pt')[:,-query_len+1:]
+                    # value = torch.load(f'./cacheDump/data/{index}_{10}_{layer_index}_value.pt')[:,-query_len+1:]
+                    # new_keys = batch_keys.narrow(1, sum(tokens_len[0][:context_id]), query_len-1)
+                    # new_values = batch_values.narrow(1, sum(tokens_len[0][:context_id]), query_len-1)
+                    # new_keys.copy_(key)
+                    # new_values.copy_(value)
+                    # total_lens += key.shape[1]
+                    pass
+                else:
+                    key = torch.load(f'./cacheDump/data/{index}_{context_id}_{layer_index}_key.pt')[:,system_len:-query_len+1]
+                    value  = torch.load(f'./cacheDump/data/{index}_{context_id}_{layer_index}_value.pt')[:,system_len:-query_len+1]
+                    q_len = sum(tokens_len[0][:context_id])
+                    new_keys = batch_keys.narrow(1, q_len, tokens_len[0][context_id])
+                    new_values = batch_values.narrow(1, q_len, tokens_len[0][context_id])
+                    new_keys.copy_(key)
+                    new_values.copy_(value)
+                    total_lens += key.shape[1]
+        self.current_seq_len+=sum(tokens_len[0][:-1])
+    def footprint(self):
+
+        fp = []
+        for layer in self.key_states + self.value_states:
+            dev = layer.device.index
+            while len(fp) <= dev: fp.append(0)
+            fp[dev] += layer.numel() * 2
+        return fp

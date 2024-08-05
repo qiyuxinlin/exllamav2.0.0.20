@@ -392,6 +392,7 @@ class ExLlamaV2BaseGenerator:
                         model_name:str,
                         position_offsets: torch.Tensor | None = None,
                         input_embeddings: torch.Tensor | None = None,
+                        rate:float | None = None
                         ):
 
         self.cache.current_seq_len = 0
@@ -410,9 +411,37 @@ class ExLlamaV2BaseGenerator:
                            batch=batch,
                            data_name=data_name,
                            model_name=model_name,
+                           rate=rate
                            )
         if self.abort_event and self.abort_event.is_set():
             self.sequence_ids = self.sequence_ids[:, :self.cache.current_seq_len + 1]
+
+
+    def cache_query_select_token(self,
+                        input_ids: torch.Tensor,
+                        importance:torch.Tensor,
+                        tokens_len:list,
+                        position_offsets: torch.Tensor | None = None,
+                        input_embeddings: torch.Tensor | None = None,
+                        ):
+
+        self.cache.current_seq_len = 0
+        self.sequence_ids = input_ids
+
+        self.model.cache_query_select_token(input_ids[:, :-1],
+                           self.cache,
+                           input_mask = None,
+                           preprocess_only = True,
+                           loras = None,
+                           position_offsets = position_offsets,
+                           abort_event = self.abort_event,
+                           indexed_embeddings = input_embeddings,
+                           importance = importance,
+                           tokens_len=tokens_len,
+                           )
+        if self.abort_event and self.abort_event.is_set():
+            self.sequence_ids = self.sequence_ids[:, :self.cache.current_seq_len + 1]
+
     def _dump_gen_begin_base(self,
                         input_ids: torch.Tensor,
                         mask: torch.Tensor | None = None,
@@ -422,7 +451,10 @@ class ExLlamaV2BaseGenerator:
                         context_id:int | None = None,
                         index:int | None = None,
                         data_name:str | None = None,
-                        model_name:str | None = None):
+                        model_name:str | None = None,
+                        system_len:str | None = None,
+                        query_prefix_len:str | None = None,
+                        context_num:int | None = None):
         self.cache.current_seq_len = 0
         self.sequence_ids = input_ids
 
@@ -437,7 +469,42 @@ class ExLlamaV2BaseGenerator:
                            context_id = context_id,
                            index = index,
                            data_name=data_name,
-                           model_name=model_name)
+                           model_name=model_name,
+                           system_len=system_len,
+                           query_prefix_len=query_prefix_len,
+                           context_num=context_num)
+        if self.abort_event and self.abort_event.is_set():
+            self.sequence_ids = self.sequence_ids[:, :self.cache.current_seq_len + 1]
+
+    def _dump_gen_begin_base_importance(self,
+                        input_ids: torch.Tensor,
+                        mask: torch.Tensor | None = None,
+                        loras: ExLlamaV2Lora or list[ExLlamaV2Lora] or None = None,
+                        position_offsets: torch.Tensor | None = None,
+                        input_embeddings: torch.Tensor | None = None,
+                        context_id:int | None = None,
+                        index:int | None = None,
+                        data_name:str | None = None,
+                        model_name:str | None = None,
+                        p_len:int | None = None,
+                        system_len:int | None = None):
+        self.cache.current_seq_len = 0
+        self.sequence_ids = input_ids
+
+        self.model.dump_forward_importance(input_ids[:, :],
+                           self.cache,
+                           additional_attn_mask = mask,
+                           preprocess_only = True,
+                           loras = loras,
+                           position_offsets = position_offsets,
+                           abort_event = self.abort_event,
+                           indexed_embeddings = input_embeddings,
+                           context_id = context_id,
+                           index = index,
+                           data_name=data_name,
+                           model_name=model_name,
+                           p_len=p_len,
+                           system_len=system_len)
         if self.abort_event and self.abort_event.is_set():
             self.sequence_ids = self.sequence_ids[:, :self.cache.current_seq_len + 1]
     def _gen_begin_base_warm_up(self,
@@ -1783,7 +1850,7 @@ class ExLlamaV2BaseGenerator:
                                  position_offsets = position_offsets,
                                  input_embeddings = input_embeddings,
                                  last_layer_flag=last_layer_flag,
-                                 last_layer=last_layer,rate=rate,layer_index=2,tokens_len=tokens_len,
+                                 last_layer=last_layer,rate=rate,layer_index=1,tokens_len=tokens_len,
                                  data_name=data_name,model_name=model_name,batch = batch)
             k_sub_all = k_change_mask - k_full_mask
             k_sub_all = k_sub_all.squeeze(0)
@@ -1791,11 +1858,12 @@ class ExLlamaV2BaseGenerator:
             k_sub_all = torch.abs(k_sub_all)
             k_sum = torch.sum(k_sub_all,dim=1)
             k_sum = k_sum.tolist()
-            if ~cacheBlend:
+            if not cacheBlend:
                 k_sum = signal.detrend(k_sum, axis=0, type='linear', bp=0, overwrite_data=False)
+            k_sum = k_sum[system_len:]
             k_sum = torch.tensor(k_sum,device=k_sub_all.device)
-            # k_sub_all = torch.abs(k_sub_all)
             k_need_index = torch.topk(k_sum,int(rate*(q_len - system_len))).indices.to('cpu')
+            k_need_index = k_need_index + system_len
         else:
             # 测试直接返回正确答案的位置
             k_need_index = torch.arange(tokens_start[1],tokens_start[2])
@@ -2043,7 +2111,6 @@ class ExLlamaV2BaseGenerator:
 
         # 由于要构造mask，所以要获取每段context的长度，所以得实现一个encode
         tokens_list = []
-        passage_token_list = []
         tokens_len = []
         for passage in prompt:
             passage_tokens = None
@@ -2051,7 +2118,6 @@ class ExLlamaV2BaseGenerator:
             for context in passage:
                 context_tokens = self.tokenizer.encode(context, add_bos = add_bos, 
                                                        encode_special_tokens = True)
-                passage_token_list.append(context_tokens)
                 passage_len.append(context_tokens.shape[1])
                 if passage_tokens is None:
                     passage_tokens = context_tokens
@@ -2191,66 +2257,534 @@ class ExLlamaV2BaseGenerator:
         q_len = ids.shape[1]
         tokens_len = [tokens_len[0][1:]]
         system_len = tokens_len[0][0]
-        # 根据rag模型选择重算哪些文本
-        processed_chunk_list = []
-        for pid, passage_token in enumerate(passage_token_list):
-            if pid ==0 or pid == len(passage_token_list)-1:
-                continue
-            passsage_text = prompt[0][pid]
-            tokenize_file(self.tokenizer,passsage_text,pid)
-            chunks = text_splitter.split_text(passsage_text)
-            for i, chunk in enumerate(chunks):
-                meta = {}
-                _, cat_text, position_idx_record = read_lookup_table(f'./retrival/{pid}.txt')
-                start, end = find_text_indices(chunk, cat_text, position_idx_record)
-                if end == None:
-                    continue
-                output = retrival_model.encode(chunk, return_dense=True, return_sparse=True, return_colbert_vecs=True)
-                meta['content'] = chunk
-                meta['start'] = start
-                meta['end'] = end
-                meta['dense_vecs'] = output['dense_vecs']
-                meta['lexical_weights'] = output['lexical_weights']
-                meta['colbert_vecs'] = output['colbert_vecs']
-                meta['passage_idx'] = pid
-                processed_chunk_list.append(meta)
+        # 这里是根据计算选
+        if rate != -1:
+            k_need_index = []
+            for i,start in enumerate(tokens_start[:-1]):
+                end = tokens_start[i+1]
+                k_need_index.extend(range(start,start+int((end-start)*rate)))
+            k_need_index = torch.tensor(k_need_index,dtype=torch.int)
+            # k_change_mask, k_full_mask = self.cache_blend_select_index(ids,
+            #                      mask,
+            #                      whole_mask,
+            #                      loras,
+            #                      position_offsets = position_offsets,
+            #                      input_embeddings = input_embeddings,
+            #                      last_layer_flag=last_layer_flag,
+            #                      last_layer=last_layer,rate=rate,layer_index=1,tokens_len=tokens_len,
+            #                      data_name=data_name,model_name=model_name,batch = batch)
+            # k_sub_all = k_change_mask - k_full_mask
+            # k_sub_all = k_sub_all.squeeze(0)
+            # k_sub_all = k_sub_all.reshape(q_len,-1)
+            # k_sub_all = torch.abs(k_sub_all)
+            # k_sum = torch.sum(k_sub_all,dim=1)
+            # k_sum = k_sum.tolist()
+            # if not cacheBlend:
+            #     k_sum = signal.detrend(k_sum, axis=0, type='linear', bp=0, overwrite_data=False)
+            # k_sum = k_sum[system_len:]
+            # k_sum = torch.tensor(k_sum,device=k_sub_all.device)
+            # k_need_index = torch.topk(k_sum,int(rate*(q_len - system_len))).indices.to('cpu')
+            # k_need_index = k_need_index + system_len
+        else:
+            # 测试直接返回正确答案的位置
+            k_need_index = torch.arange(tokens_start[1],tokens_start[2])
+        
         # x_need_index, indices = torch.sort(x_need_index)
         # print(k_need_index)
-        score_list = compute_score(retrival_model, processed_chunk_list,prompt[0][-1])
-        sorted_score = sorted(range(len(score_list)), key=lambda i: score_list[i], reverse=True)
-        all_length = int(sum(tokens_len[0][1:-1])*rate)
-        recompute_len = 0
-        k_need_index = []
-        for i,idx in enumerate(sorted_score):
-            pid = processed_chunk_list[idx]['passage_idx']
-            # if pid == 1:
-            #     continue
-            # print(processed_chunk_list[idx]['content'])
-            length = processed_chunk_list[idx]['end']  + 1 - processed_chunk_list[idx]['start']
-            
-            if recompute_len+length > all_length:
-                real_start = tokens_start[pid-1] + processed_chunk_list[idx]['start']
-                real_end = real_start + all_length - recompute_len
-                k_need_index.extend(range(real_start,real_end))
-                break
-            start = processed_chunk_list[idx]['start']
-            end = processed_chunk_list[idx]['end']
-            real_start = tokens_start[pid-1] + start
-            real_end = tokens_start[pid-1] + end
-            k_need_index.extend(range(real_start,real_end+1))
-            recompute_len += length
 
-        k_need_index = torch.tensor(k_need_index,dtype=torch.int64)
         if rate != 0: # rate 为0就什么都不要改了
             k_need_index = torch.cat((torch.arange(0,system_len),k_need_index),dim=0)
         
         query_len = tokens_len[0][-1]
         # 怎么把选择出来的k_need_index改变到ids上
         # ids = tokens_list[0][:,k_need_index]
-        print(k_need_index.shape,all_length+system_len)
+        print(k_need_index.shape)
         # print(self.tokenizer.decode(ids[:,k_need_index.to('cpu')])[0])
         
         # self.cache.load_state(batch,tokens_len)
+        ids  = tokens_list[0][:,:-query_len+1]
+        # ids = ids[:,k_need_index]
+        self.cache_retrival_gen_begin_base(input_ids=ids,
+                                           k_need_index=k_need_index,
+                                           tokens_len=tokens_len,
+                                           position_offsets=position_offsets,
+                                           input_embeddings=input_embeddings,
+                                           batch=batch,
+                                           data_name=data_name,
+                                           model_name=model_name,
+                                           )
+
+        # self.cache.load_state(batch,tokens_len)
+        ids  = tokens_list[0][:,-query_len+1:]
+        self._gen_begin_base_with_cache_current_seq_len(ids,
+                             loras,
+                             position_offsets = position_offsets,
+                             input_embeddings = input_embeddings)
+        if completion_only:
+            first_token = tokens_list[0][:,:].shape[1]
+        unhealed_token = None
+        if ids.shape[-1] < 2: token_healing = False
+        if token_healing:
+            unhealed_token = ids[:, -1:]
+            ids = ids[:, :-1]
+        mask_2 = self.tokenizer.padding_mask(ids) if batch_size > 1 else None
+        # self.sequence_ids = tokens_list[0][:,:-1]
+        print("kvcache装载完成")
+        batch_eos = [False] * batch_size
+        healed_token = []
+        id_to_piece = self.tokenizer.get_id_to_piece_list()
+        if unhealed_token is not None:
+            unhealed_token_list = unhealed_token.flatten().tolist()
+            heal = [id_to_piece[x] for x in unhealed_token_list]
+        else:
+            heal = None
+        # 这个函数内部是pass
+        gen_settings.begin_filters(heal)
+        
+        # Generate tokens
+        print('begin generate')
+        for i in range(num_tokens):
+            if self.abort_event and self.abort_event.is_set():
+                break
+            # 这里不能传additional_attn_mask，generate阶段要q_len对past_len全可见
+            logits = self.model.forward(self.sequence_ids[:, -1:],
+                                        self.cache,
+                                        input_mask = mask_2,
+                                        loras = loras,
+                                        position_offsets = position_offsets,
+                                        indexed_embeddings = input_embeddings).float().cpu()
+            
+            token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.nbce_sample(logits,
+                                                                        gen_settings,
+                                                                        self.sequence_ids,
+                                                                        random.random(),
+                                                                        self.tokenizer,
+                                                                        prefix_token = unhealed_token
+                                                                    )
+
+            if unhealed_token is not None:
+                unhealed_token_copy = unhealed_token
+                healed_token = token
+
+            if stop_token is not None:
+                for b in range(batch_size):
+                    if token[b, 0].item() == stop_token:
+                        batch_eos[b] = True
+                        if all(batch_eos): eos = True
+                    if batch_eos[b]:
+                        token[b, 0] = self.tokenizer.pad_token_id
+
+            # Post sampling hook
+
+            if gen_settings.post_sampling_hooks:
+                p = ExLlamaV2PostSamplingResult(
+                    sampled_token = token,
+                    sampled_prob = prob,
+                    logits = logits,
+                    candidate_tokens = None if ptokens.is_meta else ptokens,
+                    candidate_probs = None if pprobs.is_meta else pprobs
+                )
+                for h in gen_settings.post_sampling_hooks:
+                    h(p)
+                token = p.sampled_token
+                if p.feed_filters:
+                    gen_settings.feed_filters(token)
+
+            else:# 这个函数下面也是pass
+                gen_settings.feed_filters(token)
+
+            self.sequence_ids = torch.cat([self.sequence_ids, token], dim = 1)
+
+            unhealed_token = None
+            if batch_size != 1:
+                token = token[0]
+            if eos or token.item() in self.stop_tokens: break
+        # if large_model:
+        #     folder_path = f'./cacheDump/data/{data_name}/{model_name}'
+        #     for file_name in os.listdir(folder_path):
+        #         file_path = os.path.join(folder_path, file_name)
+        #         try:
+        #             os.unlink(file_path)
+        #         except Exception as e:
+        #             print(f'删除 {file_path} 失败. 原因: {e}')
+        #     print('KVCache Clear')
+        # Decode
+
+        decode_ids = self.sequence_ids[:, first_token:]
+        if input_embeddings is not None:
+            decode_ids = torch.stack([decode_ids[i][decode_ids[i] != self.tokenizer.pad_token_id] for i in range(batch_size)])
+
+        if len(healed_token) and completion_only:
+            decode_ids = torch.cat([healed_token, decode_ids], dim = -1)
+        if self.tokenizer.decode(decode_ids[0,-1].unsqueeze(0), decode_special_tokens) == '[UNUSED_TOKEN_145]':
+            text = self.tokenizer.decode(decode_ids[:,:-1], decode_special_tokens = decode_special_tokens)
+        else:
+            text = self.tokenizer.decode(decode_ids, decode_special_tokens = decode_special_tokens)
+        if len(healed_token) and completion_only:
+            pre_text = self.tokenizer.decode(unhealed_token_copy, decode_special_tokens = decode_special_tokens)
+            text = [t[len(p):] for t, p in zip(text, pre_text)]
+
+        if isinstance(prompt, str):
+            return text[0]
+        else:
+            return text
+        
+    def cache_splice_generate_simple_importance(self,
+                        prompt: list,
+                        gen_settings: ExLlamaV2Sampler.Settings,
+                        num_tokens: int,
+                        seed: int or None = None,
+                        token_healing: bool = False,
+                        encode_special_tokens: bool = False,
+                        decode_special_tokens: bool = False,
+                        loras: ExLlamaV2Lora or list[ExLlamaV2Lora] | None = None,
+                        stop_token: int or None = -1,
+                        add_bos: bool = False,
+                        abort_event: threading.Event | None = None,
+                        input_embeddings: torch.Tensor | None = None,
+                        completion_only: bool = False,
+                        mask_flag: bool = False,
+                        tail_mask: bool = False,
+                        tail_len: int = 50,
+                        last_layer_flag: bool = False,
+                        last_layer: int | None = None,
+                        rate: float| None = None,
+                        batch:int| None = None,
+                        data_name:str| None = None,
+                        model_name:str| None = None,
+                        large_model:bool = False,
+                        text_splitter:any | None = None,
+                        retrival_model:any | None = None,
+                        ):
+
+        """
+        Generate one or more completions.
+
+        :param prompt:
+            String or list of strings. If this argument is a list, its length determinse the batch size, and
+            the output will be list of strings as well.
+
+        :param gen_settings:
+            ExLlamaV2Sampler.Settings
+
+        :param num_tokens:
+            Max number of tokens to generate.
+
+        :param seed:
+            Seed for the sampling RNG. Doesn't guarantee perfect determinism from the implementation.
+
+        :param token_healing:
+            Apply token healing by regenerating the last token of the input sequence with prefix
+            constraint.
+
+        :param encode_special_tokens:
+            Encode special tokens (BOS etc.) represented as text in the input. If False, special tokens are
+            interpreted as text by the tokenizer.
+
+        :param decode_special_tokens:
+            Decode special tokens output by the model. If False, tokens marked as special in the tokenizer
+            are decoded as empty strings.
+
+        :param loras:
+            (List of) ExLlamaV2Lora objects to apply during generation
+
+        :param stop_token:
+            ID of the stop token. If this argument is None, no stop token will be considered. The default
+            value is -1, which is interpreted as whatever the EOS token is defined to be in the tokenizer
+            model.
+
+        :param add_bos:
+            Prepend the tokenizer's specified BOS token to the input.
+
+        :param abort_event:
+            Forwarded to the model during generation. Will abort prefill/context ingestion if triggered.
+
+        :param input_embeddings:
+            Tensor of shape (batch_size, n, hidden_size) added to the beginning of the prompt. Batching
+            is not supported when passing input embeddings unless all prompts are the same. Prompt must
+            contain the string `{{EMBED_HERE}}` to indicate where embeddings are to be inserted.
+
+        :param completion_only:
+            Only return completion. If False, returned string will include the input prompt.
+
+        :return:
+            Completion(s) (str or list[str] depending on the type of the input prompt argument)
+        """
+
+        self.abort_event = abort_event
+        if self.abort_event: self.abort_event.clear()
+
+        # Default stop token
+
+        if stop_token == -1: stop_token = self.tokenizer.eos_token_id
+
+        # Apply seed
+
+        if seed is not None: random.seed(seed)
+
+        # Tokenize input and produce padding mask if needed, inserting embeddings if provided
+
+        batch_size = len(prompt)
+        assert batch_size == 1
+        prompts_identical = batch_size == 1 or all(s == prompt[0] for s in prompt)
+
+
+        # 由于要构造mask，所以要获取每段context的长度，所以得实现一个encode
+        tokens_list = []
+        passage_token_list = []
+        tokens_len = []
+        for passage in prompt:
+            passage_tokens = None
+            passage_len = []
+            for context in passage:
+                context_tokens = self.tokenizer.encode(context, add_bos = add_bos, 
+                                                       encode_special_tokens = True)
+                passage_token_list.append(context_tokens)
+                passage_len.append(context_tokens.shape[1])
+                if passage_tokens is None:
+                    passage_tokens = context_tokens
+                else:
+                    passage_tokens = torch.cat((passage_tokens, context_tokens), dim = 1)
+
+            tokens_list.append(passage_tokens)
+            tokens_len.append(passage_len)
+
+        if large_model:
+            query_prefix_len = self.tokenizer.encode(prompt[0][-1].split('Question: ')[0]).shape[1]
+            system_token = tokens_list[0][:,:tokens_len[0][0]]
+            system_len = system_token.shape[1]
+            query_token = tokens_list[0][:,-tokens_len[0][-1]:]
+            query_len = query_token.shape[1]
+            all_context_tokens = []
+            for index in range(len(tokens_len[0])):
+                if index > 0:
+                    context_token = tokens_list[0][:,sum(tokens_len[0][:index]):sum(tokens_len[0][:index+1])]
+                    ids = torch.cat((system_token,context_token),dim=1).to(torch.long)
+                    all_context_tokens.append(ids)
+            # text = self.tokenizer.decode(ids[0])
+            # print(text)
+            for (context_id,context_tokens) in enumerate(all_context_tokens):
+                    q_len = context_tokens.shape[1]
+                    position_offsets = torch.tensor(0, dtype = torch.int).unsqueeze(0)
+                    self._dump_gen_begin_base(context_tokens,
+                                 position_offsets = position_offsets,
+                                 input_embeddings = input_embeddings,
+                                 context_id = context_id+1,
+                                 index=batch,
+                                 data_name=data_name,
+                                 model_name=model_name,
+                                 system_len=system_len,
+                                 query_prefix_len=query_prefix_len,
+                                 context_num = len(all_context_tokens))
+            print('KVCache Dump')
+            self.cache.importance.zero_()
+            importance = self.cache.load_importance(batch, model_name, data_name, sum(tokens_len[0][1:-1]))[:,:sum(tokens_len[0][1:-1]),:]
+            # system_token = tokens_list[0][:,:tokens_len[0][0]]
+            # system_len = system_token.shape[1]
+            # query_token = tokens_list[0][:,-tokens_len[0][-1]:]
+            # query_len = query_token.shape[1]
+            # all_context_tokens = []
+            # for index in range(len(tokens_len[0])):
+            #     if index > 0 and index != len(tokens_len[0])-1:
+            #         context_token = tokens_list[0][:,sum(tokens_len[0][:index]):sum(tokens_len[0][:index+1])]
+            #         ids = torch.cat((system_token,context_token),dim=1).to(torch.long)
+            #         all_context_tokens.append(ids)
+            # # text = self.tokenizer.decode(ids[0])
+            # # print(text)
+            # p_len = 0
+            # for (context_id,context_tokens) in enumerate(all_context_tokens):
+            #         q_len = context_tokens.shape[1]
+            #         position_offsets = torch.tensor(0, dtype = torch.int).unsqueeze(0)
+            #         self._dump_gen_begin_base_importance(context_tokens,
+            #                      position_offsets = position_offsets,
+            #                      input_embeddings = input_embeddings,
+            #                      context_id = context_id+1,index=batch,data_name=data_name, model_name=model_name, p_len=p_len,system_len=system_len)
+            #         p_len += (q_len - system_len)
+            # importance = self.cache.importance[:,:sum(tokens_len[0][1:-1]),:].clone()
+            # self.cache.dump_importance(batch, model_name, data_name, sum(tokens_len[0][1:-1]))
+            # self.cache.importance.zero_()
+            # print('KVCache Dump')
+        else:
+            self.cache.importance.zero_()
+            importance = self.cache.load_importance(batch, model_name, data_name, sum(tokens_len[0][1:-1]))[:,:sum(tokens_len[0][1:-1]),:]
+            
+
+        # 每个passage需要补长度
+        max_len = max([sum(x) for x in tokens_len])
+        for i,len_i in enumerate(tokens_len):
+            len_i.insert(0, max_len - sum(len_i))
+            padd_tokens = torch.full((1, len_i[0]), self.tokenizer.pad_token_id)
+            tokens_list[i] = torch.cat((padd_tokens, tokens_list[i]), dim = 1)
+        
+            
+        # 需要返回一个position_offsets tensor
+        position_offsets = [offset[0] for offset in tokens_len]
+        position_offsets = torch.tensor(position_offsets, dtype = torch.int).unsqueeze(0)
+        ids = torch.cat(tokens_list, dim = 0).to(torch.long)
+        # text = self.tokenizer.decode(ids[0])
+        # print(text)
+        if prompts_identical:
+            position_offsets = None
+
+        # Truncate prompt if generation would cause cache overflow
+        tokens_start = [sum(tokens_len[0][:i]) for i in range(2,len(tokens_len[0]))]
+        print(f'prompt length: {ids.shape[1]}\n{tokens_start}')
+        overflow = ids.shape[-1] + num_tokens - self.model.config.max_seq_len
+        if overflow > 0: ids = ids[:, overflow:]
+        else: overflow = 0
+        
+        # generate阶段传一个全可见的mask回去
+        mask_2 = self.tokenizer.padding_mask(ids) if batch_size > 1 else None
+        # 改mask
+        mask_list = []
+        sum_len = sum(tokens_len[0])
+        for passage_index in range(batch_size):
+            inf_mask_1 = torch.full((tokens_len[passage_index][0], sum_len), -65504)
+            inf_mask_2 = torch.full((sum_len - tokens_len[passage_index][0], tokens_len[passage_index][0]), -65504)
+            if passage_index == 0 and batch_size != 1: # pad + query
+                current_start = tokens_len[passage_index][1]
+                mask = torch.triu(torch.full((current_start, current_start), -65504.0),diagonal=1)
+            elif mask_flag == False: # 如果不改mask,走input_masks
+                mask = torch.triu(torch.full((sum_len - tokens_len[passage_index][0], sum_len -tokens_len[passage_index][0]), -65504.0),diagonal=1)
+            else: # pad + sys + context + query
+                system_len = tokens_len[passage_index][1]
+                current_start = system_len
+                question_len = tokens_len[passage_index][-1]
+                system_context_len = sum(tokens_len[passage_index][1:-1])
+                context_len = sum(tokens_len[passage_index][2:-1])
+                sys_mask = torch.triu(torch.full((system_len, system_len), -65504.0),diagonal=1)
+                context_sys_mask = torch.zeros(context_len, system_len)
+                mask = torch.cat((sys_mask,context_sys_mask),dim=0)
+                # 拼context
+                for length in tokens_len[passage_index][2:-1]:
+                    zero_mask = torch.full((current_start,length), -65504.0)
+                    context_mask = torch.triu(torch.full((length, length), -65504.0),diagonal=1)
+                    current_start += length
+                    zero_mask_2 = torch.full((system_context_len - current_start,length), -65504.0)
+                    tmp_mask = torch.cat((zero_mask,context_mask,zero_mask_2),dim=0)
+                    mask = torch.cat((mask,tmp_mask),dim=1)
+                    #尾部填充atten
+                if tail_mask == True:
+                    current_start = system_len
+                    for length in tokens_len[passage_index][2:-1]:
+                        current_start += length
+                        mask[current_start-tail_len:current_start,system_len:current_start-length] = 0
+                # 拼query
+                zero_mask_3 = torch.full((system_context_len, question_len), -65504.0)
+                mask = torch.cat((mask,zero_mask_3),dim=1)
+                question_mask_1 = torch.zeros(question_len, system_context_len)
+                question_mask_2 = torch.triu(torch.full((question_len, question_len), -65504.0),diagonal=1)
+                question_mask = torch.cat((question_mask_1,question_mask_2),dim=1)
+                mask = torch.cat((mask,question_mask),dim=0)
+
+            mask = torch.cat((inf_mask_2,mask),dim=1)
+            mask = torch.cat((inf_mask_1,mask),dim=0)
+            mask = mask.unsqueeze(0)
+            mask_list.append(mask)
+        mask = torch.cat(mask_list, dim = 0)
+
+        first_token = max(-overflow, 0)
+
+        if last_layer_flag == True:
+            whole_mask_list = []
+            for passage_index in range(batch_size):
+                inf_mask_1 = torch.full((tokens_len[passage_index][0], sum_len), -65504)
+                inf_mask_2 = torch.full((sum_len - tokens_len[passage_index][0], tokens_len[passage_index][0]), -65504)
+                whole_mask = torch.triu(torch.full((sum_len - tokens_len[passage_index][0], sum_len -tokens_len[passage_index][0]), -65504.0),diagonal=1)
+                whole_mask = torch.cat((inf_mask_2,whole_mask),dim=1)
+                whole_mask = torch.cat((inf_mask_1,whole_mask),dim=0)
+                whole_mask = whole_mask.unsqueeze(0)
+                whole_mask_list.append(whole_mask)
+            whole_mask = torch.cat(whole_mask_list, dim = 0)
+        
+        else:
+            whole_mask = None
+
+        # Completion only
+
+        if completion_only:
+            first_token = ids.shape[-1]
+
+        # Prepare for healing
+
+        unhealed_token = None
+        if ids.shape[-1] < 2: token_healing = False
+        if token_healing:
+            unhealed_token = ids[:, -1:]
+            ids = ids[:, :-1]
+        ids = ids[:,:-tokens_len[0][-1]]
+        q_len = ids.shape[1]
+        tokens_len = [tokens_len[0][1:]]
+        system_len = tokens_len[0][0]
+
+        
+        query_len = tokens_len[0][-1]
+
+
+        # 让query去挑
+        # 怎么把选择出来的k_need_index改变到ids上
+        # ids = tokens_list[0][:,k_need_index]
+        # print(self.tokenizer.decode(ids[:,k_need_index.to('cpu')])[0])
+
+        # self.cache.load_state(batch,tokens_len)
+        torch.set_printoptions(threshold=10_000)
+        importance = torch.sum(importance[-1], dim=1)
+        # importance = torch.sum(torch.sum(importance[-3:], dim=0), dim=1)
+        chunk_score = []
+        start = []
+        end = []
+        chunk_size = 1
+        chunk_overlap = 1
+        # 将token按64个token一个块划分，块与块之间重叠32个token
+        tokens_start_without_prefix = torch.tensor(tokens_start,dtype=torch.int) - system_len
+        tokens_start_without_prefix = tokens_start_without_prefix.tolist()
+        for i,chunk_start in enumerate(tokens_start_without_prefix[:-1]):
+            for mini_start in range(chunk_start,tokens_start_without_prefix[i+1],chunk_overlap):
+                mini_end = min(tokens_start_without_prefix[i+1],mini_start+chunk_size)
+                chunk_score.append(max(importance[mini_start:mini_end]))
+                start.append(mini_start)
+                end.append(mini_end)
+        recompute_len = int(importance.shape[0] * rate)
+        # 删除第一个context的块，因为重算它没有用
+        idx = 0
+        for s in start:
+            if s < tokens_start_without_prefix[1]:
+                idx+=1
+        start = start[idx:]
+        end = end[idx:]
+        chunk_score = chunk_score[idx:]
+        _, sort_chunk = torch.sort(torch.tensor(chunk_score),descending=True)
+        recompute_index = []
+        for i,chunk_index in enumerate(sort_chunk):
+            if len(recompute_index) < recompute_len:
+                recompute_index.extend(range(start[chunk_index],end[chunk_index]))
+                recompute_index_set = set(recompute_index)
+                recompute_index = list(recompute_index_set)
+            else: break
+        if len(recompute_index) > recompute_len:
+            diff = len(recompute_index) - recompute_len
+            _ , b = torch.sort(importance[start[sort_chunk[i-1]]:end[sort_chunk[i-1]]])
+            b = b + start[sort_chunk[i-1]]
+            b = set(b.tolist())
+            recompute_index_set = set(recompute_index)
+            joint = recompute_index_set & b
+            joint_list = list(joint)
+            _, bb = torch.sort(importance[joint_list])
+            bb = bb + start[sort_chunk[i-1]]
+            for j in bb[:diff].tolist():
+                recompute_index.remove(j)
+        k_need_index = torch.tensor(recompute_index,dtype=torch.int)
+        k_need_index = k_need_index + system_len
+        # importance = torch.sum(torch.sum(importance, dim=0), dim=1)
+        # sorted_importance , k_need_index = torch.sort(importance,descending=True)
+        # k_need_index += system_len
+        # k_need_index = k_need_index[k_need_index>=tokens_start[1]]
+        # ####
+        # # k_need_index = torch.cat((torch.range(tokens_start[1],tokens_start[2])[:int(rate*(tokens_start[2]-tokens_start[1]))],k_need_index)).to(torch.int32)
+        # k_need_index = k_need_index[:int(rate*sum(tokens_len[0][1:-1]))]
+        if rate != 0:
+            k_need_index = torch.cat((torch.range(0,system_len),k_need_index)).to(torch.int32)
+        
         ids  = tokens_list[0][:,:-query_len+1]
         # ids = ids[:,k_need_index]
         self.cache_retrival_gen_begin_base(input_ids=ids,
@@ -2464,3 +2998,43 @@ def get_top_k_idx(query_score_list, k=5):
             sorted(range(len(query_score)), key=lambda i: query_score[i], reverse=True)[:k]
         )
     return query_score_top_k_idx
+
+def split_text_by_punctuation_and_overlap(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    """Split text into chunks at punctuation, with specified size and overlap, without splitting words."""
+    punctuation = ".!?,;:"  # Define punctuation marks used to split the text
+    chunks = []
+    position = 0
+    text_length = len(text)
+
+    while position < text_length:
+        # Check if the remaining text is less than the chunk size
+        if position + chunk_size >= text_length:
+            chunks.append(text[position:])
+            break
+
+        # Find the end of the chunk ideally at a punctuation mark near the chunk size limit
+        end = position + chunk_size
+        while end < text_length and not (text[end] in punctuation and text[end + 1].isspace()):
+            end += 1
+
+        # Ensure the chunk ends at a space after punctuation
+        if end < text_length:
+            end += 1
+
+        # Find the nearest word boundary after punctuation
+        while end < text_length and not text[end].isspace():
+            end += 1
+
+        # Extract the chunk
+        chunk = text[position:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        
+        # Calculate the next start position with overlap, ensuring it starts at a word boundary
+        position = max(end - chunk_overlap, position + 1)
+        while position > 0 and not text[position - 1].isspace():
+            position -= 1
+
+    return chunks
+
+

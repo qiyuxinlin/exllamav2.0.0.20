@@ -5,6 +5,7 @@ from exllamav2.cache import ExLlamaV2CacheBase
 from exllamav2.cache import ExLlamaV2Cache
 from exllamav2.cache import ExLlamaV2Cache_Q4
 from exllamav2.cache import ExLlamaV2Cache_CPU
+from exllamav2.cache import ExLlamaV2Cache_importance
 from exllamav2.cache import ExLlamaV2Cache_8bit
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.tokenizer.tokenizer import ExLlamaV2Tokenizer

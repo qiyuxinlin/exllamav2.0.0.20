@@ -871,6 +871,7 @@ class ExLlamaV2:
             if attn_size > max_a:
                 cs = (math.sqrt(past_len ** 2 + 4 * max_a) - past_len) / 2
                 chunk_size = min(chunk_size, math.floor(cs))
+                # chunk_size = max(chunk_size, math.floor(cs))
 
             # Process chunk
 
@@ -910,7 +911,144 @@ class ExLlamaV2:
             return result
         else:
             return result, last_state
+        
+    @torch.inference_mode()
+    def cache_query_select_token(self,
+                input_ids: torch.Tensor,
+                cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
+                input_mask: torch.Tensor | None = None,
+                additional_attn_mask: torch.Tensor | None = None,
+                preprocess_only: bool = False,
+                last_id_only: bool = False,
+                loras: list[ExLlamaV2Lora] | None = None,
+                return_last_state: bool = False,
+                position_offsets: torch.Tensor | None = None,
+                abort_event: threading.Event | None = None,
+                whole_mask: torch.Tensor | None = None,
+                last_layer_flag: bool =False,
+                last_layer:int | None = None,
+                **kwargs) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """
+        Runs a forward pass through the model. If a cache is used, also appends keys/values to the cache
+        and advances it.
 
+        :param input_ids:
+            LongTensor of input token IDs, shape (batch_size, q_len)
+
+        :param cache:
+            Optional ExLlamaV2Cache. If not provided, q_len must be less than config.max_input_len
+
+        :param input_mask:
+            Additive attention bias, shape (batch_size, past_len + q_len, q_len)
+            But zbx think it's shape should be (batch_size, past_len + q_len)
+         
+        :additional_attn_mask:
+            additional_attn_mask, shape(batch_size, seq_len, past_len + seq_len)
+        
+        :param preprocess_only:
+            Only forward up to the last layer that affects the K/V cache. Does not return logits. Used
+            to prefill the cache.
+
+        :param last_id_only:
+            Process the entire input sequence but only pass the last token through the head layer and
+            only return logits for the last token.
+
+        :param loras:
+            List of ExLlamaV2Lora objects to apply during the forward pass
+
+        :param return_last_state:
+            Also return the hidden state right before the head layer
+
+        :param position_offsets:
+            Tensor of position offsets, shape (batch_size, 1). Offset is applied to position IDs during
+            RoPE application.
+
+        :param abort_event:
+            Optional event that, if set, will abort the forward pass. Function will return None if aborted.
+
+        :return:
+            FP16 logits tensor, shape (batch_size, q_len, vocab_size)
+            (optional) state tensor, shape (batch_size, q_len, hidden_size)
+
+        :indexed_embeddings:
+            Tensor of embeddings, shape (batch_size, q_len, hidden_size), indexed by input token IDs >=
+            ExLlamaV2.EMBEDDING_INDEX
+        """
+
+        bsz, q_len = input_ids.shape
+        remaining_q_len = q_len
+
+        # Attn and MLP layers have preallocated buffers for temp states, sized by the model config. Effective max input
+        # length depends on the current batch size
+
+        effective_max_input_len = self.config.max_input_len * self.config.max_batch_size // bsz
+
+        # Confirm that the input fits within the allocated cache space
+
+        past_len = cache.current_seq_len
+        assert past_len + q_len <= cache.max_seq_len, "Total sequence length exceeds cache size in model.forward"
+
+        # Split sequence
+
+        result = None
+        last_state = None
+
+        chunk_begin = 0
+        while chunk_begin < q_len:
+
+            # Limit chunk_size to max_input_len
+
+            chunk_size = max(remaining_q_len, effective_max_input_len)
+            # chunk_size = max(remaining_q_len, effective_max_input_len)
+
+
+            # Limit chunk_size to keep size of attention operation <= max_attention_size
+
+            past_len = cache.current_seq_len
+            attn_size = (past_len + remaining_q_len) * remaining_q_len
+            max_a = self.config.max_attention_size
+            if attn_size > max_a:
+                cs = (math.sqrt(past_len ** 2 + 4 * max_a) - past_len) / 2
+                chunk_size = max(chunk_size, math.floor(cs))
+
+            # Process chunk
+
+            chunk_end = min(chunk_begin + chunk_size, q_len)
+
+            # print(f"Forward chunk length: {chunk_end - chunk_begin}")
+
+            _last_id_only = last_id_only
+            _preprocess_only = preprocess_only or (chunk_end < q_len and last_id_only)
+            r, ls = self._forward(input_ids = input_ids[:, chunk_begin : chunk_end],
+                                  cache = cache,
+                                  input_mask = input_mask,
+                                  additional_attn_mask = additional_attn_mask,
+                                  preprocess_only = _preprocess_only,
+                                  last_id_only = _last_id_only,
+                                  loras = loras,
+                                  return_last_state = return_last_state and remaining_q_len <= chunk_size,
+                                  position_offsets = position_offsets,
+                                  abort_event = abort_event,
+                                  whole_mask = whole_mask,
+                                  last_layer_flag=last_layer_flag,
+                                  last_layer=last_layer,
+                                  **kwargs)
+
+            if abort_event and abort_event.is_set(): return
+
+            if not _preprocess_only:
+                result = r if result is None else torch.cat((result, r), dim = 1)
+                r = None
+
+            chunk_begin = chunk_end
+            remaining_q_len -= chunk_size
+            last_state = ls
+
+        if last_state is None:
+            return result
+        else:
+            return result, last_state
 
     @torch.inference_mode()
     def cache_retrival_forward(self,
@@ -1002,8 +1140,8 @@ class ExLlamaV2:
 
             # Limit chunk_size to max_input_len
 
-            chunk_size = min(remaining_q_len, effective_max_input_len)
             # chunk_size = max(remaining_q_len, effective_max_input_len)
+            chunk_size = min(remaining_q_len, effective_max_input_len)
 
 
             # Limit chunk_size to keep size of attention operation <= max_attention_size
@@ -1977,6 +2115,10 @@ class ExLlamaV2:
         # Without a cache we can't process the sequence in chunks, so forward the whole thing and assume the input length
         # is less than config.max_input_len
         kwargs['dump_forward'] = True
+        kwargs['context_id'] = context_id
+        kwargs['index'] = index
+        kwargs['data_name'] = data_name
+        kwargs['model_name'] = model_name
         if cache is None or not isinstance(cache, ExLlamaV2CacheBase):
 
             assert q_len <= effective_max_input_len, "Maximum input length exceeded in model.forward"
@@ -2073,3 +2215,175 @@ class ExLlamaV2:
 
 
 
+    @torch.inference_mode()
+    def dump_forward_importance(self,
+                input_ids: torch.Tensor,
+                cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
+                input_mask: torch.Tensor | None = None,
+                additional_attn_mask: torch.Tensor | None = None,
+                preprocess_only: bool = False,
+                last_id_only: bool = False,
+                loras: list[ExLlamaV2Lora] | None = None,
+                return_last_state: bool = False,
+                position_offsets: torch.Tensor | None = None,
+                abort_event: threading.Event | None = None,
+                whole_mask: torch.Tensor | None = None,
+                last_layer_flag: bool =False,
+                last_layer:int | None = None,
+                context_id:int | None = None,
+                index:int | None = None,
+                data_name:str | None = None,
+                model_name:str | None = None,
+                **kwargs) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """
+        Runs a forward pass through the model. If a cache is used, also appends keys/values to the cache
+        and advances it.
+
+        :param input_ids:
+            LongTensor of input token IDs, shape (batch_size, q_len)
+
+        :param cache:
+            Optional ExLlamaV2Cache. If not provided, q_len must be less than config.max_input_len
+
+        :param input_mask:
+            Additive attention bias, shape (batch_size, past_len + q_len, q_len)
+            But zbx think it's shape should be (batch_size, past_len + q_len)
+         
+        :additional_attn_mask:
+            additional_attn_mask, shape(batch_size, seq_len, past_len + seq_len)
+        
+        :param preprocess_only:
+            Only forward up to the last layer that affects the K/V cache. Does not return logits. Used
+            to prefill the cache.
+
+        :param last_id_only:
+            Process the entire input sequence but only pass the last token through the head layer and
+            only return logits for the last token.
+
+        :param loras:
+            List of ExLlamaV2Lora objects to apply during the forward pass
+
+        :param return_last_state:
+            Also return the hidden state right before the head layer
+
+        :param position_offsets:
+            Tensor of position offsets, shape (batch_size, 1). Offset is applied to position IDs during
+            RoPE application.
+
+        :param abort_event:
+            Optional event that, if set, will abort the forward pass. Function will return None if aborted.
+
+        :return:
+            FP16 logits tensor, shape (batch_size, q_len, vocab_size)
+            (optional) state tensor, shape (batch_size, q_len, hidden_size)
+
+        :indexed_embeddings:
+            Tensor of embeddings, shape (batch_size, q_len, hidden_size), indexed by input token IDs >=
+            ExLlamaV2.EMBEDDING_INDEX
+        """
+
+        bsz, q_len = input_ids.shape
+        remaining_q_len = q_len
+
+        # Attn and MLP layers have preallocated buffers for temp states, sized by the model config. Effective max input
+        # length depends on the current batch size
+
+        effective_max_input_len = self.config.max_input_len * self.config.max_batch_size // bsz
+
+        # Without a cache we can't process the sequence in chunks, so forward the whole thing and assume the input length
+        # is less than config.max_input_len
+        kwargs['dump_forward_importance'] = True
+        if cache is None or not isinstance(cache, ExLlamaV2CacheBase):
+
+            assert q_len <= effective_max_input_len, "Maximum input length exceeded in model.forward"
+
+            result, last_state = self._forward(input_ids = input_ids,
+                                               cache = cache,
+                                               input_mask = input_mask,
+                                               additional_attn_mask = additional_attn_mask,
+                                               preprocess_only = preprocess_only,
+                                               last_id_only = last_id_only,
+                                               loras = loras,
+                                               return_last_state = return_last_state,
+                                               position_offsets = position_offsets,
+                                               abort_event = abort_event,
+                                               whole_mask = whole_mask,
+                                               last_layer_flag=last_layer_flag,
+                                               last_layer=last_layer,
+                                               **kwargs)
+
+            if abort_event and abort_event.is_set(): return
+
+            if last_state is None:
+                return result
+            else:
+                return result, last_state
+
+        # Confirm that the input fits within the allocated cache space
+
+        past_len = cache.current_seq_len
+        assert past_len + q_len <= cache.max_seq_len, "Total sequence length exceeds cache size in model.forward"
+
+        # Split sequence
+
+        result = None
+        last_state = None
+
+        chunk_begin = 0
+        while chunk_begin < q_len:
+
+            # Limit chunk_size to max_input_len
+
+            chunk_size = min(remaining_q_len, effective_max_input_len)
+            # chunk_size = max(remaining_q_len, effective_max_input_len)
+
+
+            # Limit chunk_size to keep size of attention operation <= max_attention_size
+
+            past_len = cache.current_seq_len
+            attn_size = (past_len + remaining_q_len) * remaining_q_len
+            max_a = self.config.max_attention_size
+            if attn_size > max_a:
+                cs = (math.sqrt(past_len ** 2 + 4 * max_a) - past_len) / 2
+                chunk_size = min(chunk_size, math.floor(cs))
+
+            # Process chunk
+
+            chunk_end = min(chunk_begin + chunk_size, q_len)
+
+            # print(f"Forward chunk length: {chunk_end - chunk_begin}")
+
+            _last_id_only = last_id_only
+            _preprocess_only = preprocess_only or (chunk_end < q_len and last_id_only)
+
+            r, ls = self._forward(input_ids = input_ids[:, chunk_begin : chunk_end],
+                                  cache = cache,
+                                  input_mask = input_mask,
+                                  additional_attn_mask = additional_attn_mask,
+                                  preprocess_only = _preprocess_only,
+                                  last_id_only = _last_id_only,
+                                  loras = loras,
+                                  return_last_state = return_last_state and remaining_q_len <= chunk_size,
+                                  position_offsets = position_offsets,
+                                  abort_event = abort_event,
+                                  whole_mask = whole_mask,
+                                  last_layer_flag=last_layer_flag,
+                                  last_layer=last_layer,
+                                  **kwargs)
+
+            if abort_event and abort_event.is_set(): return
+
+            if not _preprocess_only:
+                result = r if result is None else torch.cat((result, r), dim = 1)
+                r = None
+
+            chunk_begin = chunk_end
+            remaining_q_len -= chunk_size
+            last_state = ls
+        cache.dump_state(context_id,index,data_name,model_name)
+        cache.current_seq_len = 0
+        if last_state is None:
+            return result
+        else:
+            return result, last_state
